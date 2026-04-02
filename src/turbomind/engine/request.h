@@ -173,6 +173,9 @@ struct RequestCache {
 
     float rope_base = 0.f;
 
+    Tensor conv_states;       // Gated DeltaNet conv state (per-request)
+    Tensor recurrent_states;  // Gated DeltaNet recurrent state
+
     Interval output_hidden_states;
     Interval output_logits;
 };
