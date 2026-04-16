@@ -16,8 +16,24 @@
 #include "src/turbomind/models/llama/LlamaLinear.h"
 
 #include "src/turbomind/utils/cuda_utils.h"
+#include "src/turbomind/core/logger.h"
+#include <cuda_bf16.h>
 
 namespace turbomind {
+
+namespace {
+void dbg_dump_bf16(const char* tag, const void* d_ptr, int count, cudaStream_t st)
+{
+    if (!d_ptr || count <= 0) return;
+    count = std::min(count, 16);
+    std::vector<__nv_bfloat16> h(count);
+    cudaMemcpyAsync(h.data(), d_ptr, count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    std::string s;
+    for (int i = 0; i < count; ++i) s += fmt::format(" {:.6f}", __bfloat162float(h[i]));
+    TM_LOG_INFO("[LINEAR_DEBUG] {} (first {}): {}", tag, count, s);
+}
+}  // namespace
 
 using namespace gemm;
 
@@ -59,6 +75,10 @@ struct LlamaLinear::Impl {
         const Tensor& V      = dense.scales;
         MatrixLayout  desc_B = dense.k_desc;
         MatrixLayout  desc_V = dense.q_desc;
+        TM_LOG_INFO("[LINEAR_DEBUG] GetOperandB: B rows={} cols={} ld={} order={} type={} num={} "
+                    "offsets={} has_scales={}",
+                    desc_B.rows, desc_B.cols, desc_B.ld, (int)desc_B.order, (int)desc_B.type,
+                    desc_B.num, (void*)desc_B.offsets, (bool)V);
         return {B, desc_B, V, desc_V};
     }
 
@@ -81,22 +101,31 @@ struct LlamaLinear::Impl {
             A = input;
         }
 
-        // SM100+ grouped bf16/fp16: use chunk() weights so Activation() runs separately.
         const bool is_cublas_grouped = offsets && getSMVersion() == 100 && dense.weight_type == kBfloat16;
+        TM_LOG_INFO("[LINEAR_DEBUG] GetOperandA: m={} input_dtype={} dense_input_type={} quantized={} "
+                    "has_indices={} has_offsets={} is_cublas_grouped={} sm={}",
+                    m, (int)input.dtype(), (int)dense.input_type, (input.dtype() != dense.input_type),
+                    (bool)indices, (bool)offsets, is_cublas_grouped, getSMVersion());
+
         if (indices && (A.dtype() == kFloat8_e4m3 || is_cublas_grouped)) {
             const auto [bsz, k] = A.shapes(0, 1);
             const int e         = indices.size() / bsz;
+            TM_LOG_INFO("[LINEAR_DEBUG] MoeDispatch: bsz={} k={} e={} total_dispatched={}", bsz, k, e, m);
             Tensor    A_e       = {{m, k}, A.dtype(), kDEVICE};
             invokeMoeDispatch(A_e, A, indices.data(), e, st);
             sync_check_cuda_error();
             if (U) {
+                TM_LOG_INFO("[LINEAR_DEBUG] MoeDispatchScales: U shape=({},{})", U.shape(0), U.shape(1));
                 Tensor U_e;
                 invokeMoeDispatchScales(U_e, U, indices.data(), e, st);
                 sync_check_cuda_error();
                 U = U_e;
             }
+            else {
+                TM_LOG_INFO("[LINEAR_DEBUG] U is empty, skip MoeDispatchScales");
+            }
             A       = A_e;
-            indices = {};  // indices already applied
+            indices = {};
         }
 
         MatrixLayout desc_A{A.dtype(), gemm::Order::kRowMajor, m, (int)A.shape(1), (int)A.stride(0)};
@@ -122,6 +151,15 @@ struct LlamaLinear::Impl {
                  const Buffer_<int>&     offsets)
     {
         using namespace gemm;
+        auto st = core::Context::stream().handle();
+
+        const bool is_moe = (bool)offsets || (bool)indices;
+        TM_LOG_INFO("[LINEAR_DEBUG] Forward: input=({},{}) dtype={} weight=({},{}) wtype={} epilogue={} "
+                    "has_indices={} has_offsets={} is_cublas_grouped={}",
+                    input.shape(0), input.shape(1), (int)input.dtype(),
+                    dense.input_dim, dense.output_dim, (int)dense.weight_type, (int)dense.epilogue,
+                    (bool)indices, (bool)offsets,
+                    (offsets && getSMVersion() == 100 && dense.weight_type == kBfloat16));
 
         Operation op{};
         op.dispatch  = dispatch_policy_;
@@ -133,13 +171,22 @@ struct LlamaLinear::Impl {
         auto&& [A, desc_A, U, desc_U] = GetOperandA(dense, input, indices, offsets);
         auto&& [B, desc_B, V, desc_V] = GetOperandB(dense);
 
+        TM_LOG_INFO("[LINEAR_DEBUG] A: rows={} cols={} ld={} order={} type={} num={} idxs={} offsets={}",
+                    desc_A.rows, desc_A.cols, desc_A.ld, (int)desc_A.order, (int)desc_A.type,
+                    desc_A.num, (void*)desc_A.idxs, (void*)desc_A.offsets);
+        TM_LOG_INFO("[LINEAR_DEBUG] B: rows={} cols={} ld={} order={} type={} num={}",
+                    desc_B.rows, desc_B.cols, desc_B.ld, (int)desc_B.order, (int)desc_B.type, desc_B.num);
+
+        if (is_moe) {
+            dbg_dump_bf16("A[0,:16]", A.raw_data(), 16, st);
+            dbg_dump_bf16("B[0,:16]", B.raw_data(), 16, st);
+        }
+
         Tensor& D = output;
         if (!D) {
             int dim = dense.epilogue == Epilogue::kGatedSilu ? dense.output_dim / 2 : dense.output_dim;
             D       = Tensor{{desc_A.rows, dim}, dense.data_type, kDEVICE};
         }
-
-        // std::cout << "D: " << D << " " << desc_B.num << "\n";
 
         MatrixLayout desc_D{
             output.dtype(),
@@ -153,6 +200,9 @@ struct LlamaLinear::Impl {
             desc_D.num     = desc_B.num;
             desc_D.offsets = const_cast<int*>(offsets.data());
         }
+
+        TM_LOG_INFO("[LINEAR_DEBUG] D: rows={} cols={} ld={} num={} offsets={}",
+                    desc_D.rows, desc_D.cols, desc_D.ld, desc_D.num, (void*)desc_D.offsets);
 
         auto ec = gemm_.Run(op,
                             1.f,
@@ -170,10 +220,15 @@ struct LlamaLinear::Impl {
                             D.raw_data(),
                             desc_D,
                             workspace_,
-                            core::Context::stream().handle());
+                            st);
 
         if (ec) {
             TM_LOG_ERROR("{}: {}", __PRETTY_FUNCTION__, ec);
+        }
+
+        if (is_moe) {
+            dbg_dump_bf16("D[0,:16]", D.raw_data(), 16, st);
+            TM_LOG_INFO("[LINEAR_DEBUG] Forward done, ec={}", ec);
         }
     }
 

@@ -14,6 +14,8 @@
 
 #include <cstdio>
 #include <vector>
+#include "src/turbomind/core/logger.h"
+#include <cuda_bf16.h>
 
 namespace turbomind::gemm {
 
@@ -370,6 +372,29 @@ public:
             return 0;
         }
 
+        TM_LOG_INFO("[CUBLAS_GROUPED_DEBUG] Launch: group_count={} active_count={} N={} K={} alpha={} beta={} "
+                    "cuda_type={} weight_is_strided_ptrs={}",
+                    group_count, active_count, N, K, alpha, beta, (int)cuda_type, weight_is_strided_ptrs);
+        for (int i = 0; i < std::min(active_count, 4); ++i) {
+            TM_LOG_INFO("[CUBLAS_GROUPED_DEBUG]   group[{}]: n(M_i)={} a_ptr={} b_ptr={} c_ptr={} lda={}",
+                        i, n_active[i], a_active[i], b_active[i], c_active[i], lda_active[i]);
+        }
+
+        {
+            auto elem = byte_size(Adesc.type, 1);
+            for (int i = 0; i < std::min(active_count, 2); ++i) {
+                std::vector<__nv_bfloat16> hA(16), hB(16);
+                cudaMemcpyAsync(hA.data(), b_active[i], 16 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, stream);
+                cudaMemcpyAsync(hB.data(), a_active[i], 16 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+                std::string sA, sB;
+                for (int j = 0; j < 16; ++j) sA += fmt::format(" {:.6f}", __bfloat162float(hA[j]));
+                for (int j = 0; j < 16; ++j) sB += fmt::format(" {:.6f}", __bfloat162float(hB[j]));
+                TM_LOG_INFO("[CUBLAS_GROUPED_DEBUG]   group[{}] input(b_active)[0:16]:{}", i, sA);
+                TM_LOG_INFO("[CUBLAS_GROUPED_DEBUG]   group[{}] weight(a_active)[0:16]:{}", i, sB);
+            }
+        }
+
         std::vector<cublasOperation_t> transa_array(active_count, CUBLAS_OP_N);
         std::vector<cublasOperation_t> transb_array(active_count, CUBLAS_OP_N);
         std::vector<int>               m_array(active_count, N);
@@ -380,7 +405,6 @@ public:
         std::vector<float>             beta_array(active_count, beta);
         std::vector<int>               group_size(active_count, 1);
 
-        // Use pre-allocated workspace for device pointer arrays (no cudaMalloc/Free per call)
         const size_t one_array   = active_count * sizeof(void*);
         const size_t total_bytes = 3 * one_array;
         TM_CHECK_LE(total_bytes, workspace.tensormaps_size);
@@ -390,7 +414,6 @@ public:
         cudaMemcpyAsync(d_ptrs + one_array, b_active.data(), one_array, cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_ptrs + 2 * one_array, c_active.data(), one_array, cudaMemcpyHostToDevice, stream);
 
-        // Stream ordering guarantees the H2D copies complete before cuBLAS reads the pointers.
         cublasStatus_t status = cublasGemmGroupedBatchedEx(cublas_,
                                                            transa_array.data(),
                                                            transb_array.data(),
@@ -417,6 +440,19 @@ public:
                 stderr, "[TM][GEMM] CublasGrouped: cublasGemmGroupedBatchedEx failed: %s\n", _cudaGetErrorEnum(status));
             return 1;
         }
+
+        {
+            cudaStreamSynchronize(stream);
+            for (int i = 0; i < std::min(active_count, 2); ++i) {
+                std::vector<__nv_bfloat16> hC(16);
+                cudaMemcpyAsync(hC.data(), c_active[i], 16 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+                std::string sC;
+                for (int j = 0; j < 16; ++j) sC += fmt::format(" {:.6f}", __bfloat162float(hC[j]));
+                TM_LOG_INFO("[CUBLAS_GROUPED_DEBUG]   group[{}] output(c_active)[0:16]:{}", i, sC);
+            }
+        }
+        TM_LOG_INFO("[CUBLAS_GROUPED_DEBUG] Launch done, status=SUCCESS");
         return 0;
     }
 

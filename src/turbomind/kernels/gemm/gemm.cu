@@ -16,6 +16,7 @@
 #include <numeric>
 #include <optional>
 #include <vector>
+#include "src/turbomind/core/logger.h"
 
 namespace turbomind::gemm {
 
@@ -318,10 +319,16 @@ int Gemm::Run(const Operation&    operation,
     spec = impl_->Dispatch(context, operation.dispatch, workspace.barriers_size, workspace.partials_size);
 
     if (spec.kernel) {
-        // std::cout << "[Gemm] dispatch: " << spec.kernel->name()  //
-        //           << " split_k=" << spec.splits                  //
-        //           << " swizzle=" << spec.swizzle << std::endl;
-        return launch(spec, stream);
+        TM_LOG_INFO("[GEMM_DEBUG] dispatch: kernel='{}' split_k={} swizzle={}",
+                    spec.kernel->name(), spec.splits, spec.swizzle);
+        TM_LOG_INFO("[GEMM_DEBUG] desc: arch={} type_a={} type_b={} type_c={} order_a={} order_b={} order_c={} "
+                    "num={} group_axis={}",
+                    context.desc().arch, (int)context.desc().type_a, (int)context.desc().type_b,
+                    (int)context.desc().type_c, (int)context.desc().order_a, (int)context.desc().order_b,
+                    (int)context.desc().order_c, context.desc().num, context.desc().group_axis);
+        auto ec = launch(spec, stream);
+        TM_LOG_INFO("[GEMM_DEBUG] launch result: ec={}", ec);
+        return ec;
     }
 
     TM_CHECK(0) << "No feasible kernel found for the problem: " << to_string(context.desc());

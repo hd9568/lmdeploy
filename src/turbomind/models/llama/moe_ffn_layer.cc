@@ -17,7 +17,50 @@
 
 // #include "dbg.h"
 
+#include "src/turbomind/core/logger.h"
+#include <cuda_bf16.h>
+
 namespace turbomind {
+
+namespace {
+
+void dump_device_floats(const char* tag, const float* d_ptr, int count, cudaStream_t st)
+{
+    if (!d_ptr || count <= 0) return;
+    count = std::min(count, 16);
+    std::vector<float> h(count);
+    cudaMemcpyAsync(h.data(), d_ptr, count * sizeof(float), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    std::string s;
+    for (int i = 0; i < count; ++i) s += fmt::format(" {:.6f}", h[i]);
+    TM_LOG_INFO("[MOE_DEBUG] {} (first {}): {}", tag, count, s);
+}
+
+void dump_device_ints(const char* tag, const int* d_ptr, int count, cudaStream_t st)
+{
+    if (!d_ptr || count <= 0) return;
+    count = std::min(count, 32);
+    std::vector<int> h(count);
+    cudaMemcpyAsync(h.data(), d_ptr, count * sizeof(int), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    std::string s;
+    for (int i = 0; i < count; ++i) s += fmt::format(" {}", h[i]);
+    TM_LOG_INFO("[MOE_DEBUG] {} (first {}): {}", tag, count, s);
+}
+
+void dump_device_bf16(const char* tag, const void* d_ptr, int count, cudaStream_t st)
+{
+    if (!d_ptr || count <= 0) return;
+    count = std::min(count, 16);
+    std::vector<__nv_bfloat16> h(count);
+    cudaMemcpyAsync(h.data(), d_ptr, count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    std::string s;
+    for (int i = 0; i < count; ++i) s += fmt::format(" {:.6f}", __bfloat162float(h[i]));
+    TM_LOG_INFO("[MOE_DEBUG] {} (first {}): {}", tag, count, s);
+}
+
+}  // namespace
 
 MoeFfnLayer::MoeFfnLayer(const ModelParam& model, const MoeParam& param, const EngineParam& engine, const Context& ctx):
     inter_size_(param.inter_size / engine.mlp_tp_size),
@@ -84,11 +127,19 @@ void MoeFfnLayer::Forward(ForwardParam& p)
 
     FT_CHECK(expert_num);
 
+    TM_LOG_INFO("[MOE_DEBUG] === MoeFfnLayer::Forward layer={} tokens={} experts={} experts_per_token={} method={} ===",
+                p.layer_id, tokens, expert_num, param_.experts_per_token, (int)param_.method);
+    TM_LOG_INFO("[MOE_DEBUG] input shape=({}, {}) dtype={}", p.input.shape(0), p.input.shape(1), (int)p.input.dtype());
+
+    const auto st = core::Context::stream().handle();
+    dump_device_bf16("input[0,:16]", p.input.raw_data(), 16, st);
+
     auto logits = Gate(p.input, moe.gate);
 
     TM_DEBUG_TENSOR(logits, "logits", 2);
 
-    const auto st = core::Context::stream().handle();
+    TM_LOG_INFO("[MOE_DEBUG] gate logits shape=({}, {})", logits.shape(0), logits.shape(1));
+    dump_device_floats("logits[0,:16]", logits.data(), std::min((int)logits.shape(1), 16), st);
 
     // dump_logits(tokens, layer_id);
 
@@ -148,6 +199,12 @@ void MoeFfnLayer::Forward(ForwardParam& p)
     }
     sync_check_cuda_error();
 
+    TM_LOG_INFO("[MOE_DEBUG] --- routing done ---");
+    dump_device_ints("f2n (token indices)", f2n_.data(), std::min(tokens * param_.experts_per_token, 32), st);
+    dump_device_ints("f2E (expert ids)", f2E_.data(), std::min(tokens * param_.experts_per_token, 32), st);
+    dump_device_floats("scales", scales_.data(), std::min(tokens * param_.experts_per_token, 16), st);
+    dump_device_ints("offsets", offsets_.data(), std::min(expert_num + 1, 32), st);
+
     if (is_warm_up_) {
         std::mt19937     g;
         const auto       expert_ids = SampleUniform(tokens, expert_num, param_.experts_per_token, g);
@@ -191,16 +248,37 @@ void MoeFfnLayer::Forward(ForwardParam& p)
         auto indices = f2n_.slice(0, tokens * param_.experts_per_token);
         auto offsets = offsets_.slice(0, expert_num + 1);
 
+        TM_LOG_INFO("[MOE_DEBUG] --- fused MoE path (block) ---");
+        TM_LOG_INFO("[MOE_DEBUG] block.fused_gating_intermediate: input_dim={} output_dim={} weight_type={} is_fused_silu={}",
+                    block.fused_gating_intermediate.input_dim, block.fused_gating_intermediate.output_dim,
+                    (int)block.fused_gating_intermediate.weight_type, block.is_fused_silu);
+
         Tensor inter = linear_.Forward(p.input, block.fused_gating_intermediate, indices, offsets_);
         sync_check_cuda_error();
 
+        TM_LOG_INFO("[MOE_DEBUG] after 1st linear (fused_gating_intermediate): shape=({}, {}) dtype={}",
+                    inter.shape(0), inter.shape(1), (int)inter.dtype());
+        dump_device_bf16("inter[0,:16]", inter.raw_data(), 16, st);
+
         if (!block.is_fused_silu) {
+            TM_LOG_INFO("[MOE_DEBUG] applying Activation (unfused silu) act_type={}", (int)moe.block.act_type);
             Activation(inter, block.fused_gating_intermediate.bias, f2E_, moe.block.act_type, st);
             sync_check_cuda_error();
+            TM_LOG_INFO("[MOE_DEBUG] after Activation:");
+            dump_device_bf16("inter_post_act[0,:16]", inter.raw_data(), 16, st);
         }
 
-        linear_.Forward(inter.slice({0, 0}, {-1, inter_size_}), block.output, {}, offsets, temp_);
+        TM_LOG_INFO("[MOE_DEBUG] block.output: input_dim={} output_dim={} weight_type={}",
+                    block.output.input_dim, block.output.output_dim, (int)block.output.weight_type);
+
+        auto inter_slice = inter.slice({0, 0}, {-1, inter_size_});
+        TM_LOG_INFO("[MOE_DEBUG] inter_slice for 2nd linear: shape=({}, {})", inter_slice.shape(0), inter_slice.shape(1));
+
+        linear_.Forward(inter_slice, block.output, {}, offsets, temp_);
         sync_check_cuda_error();
+
+        TM_LOG_INFO("[MOE_DEBUG] after 2nd linear (output): temp_ shape=({}, {})", temp_.shape(0), temp_.shape(1));
+        dump_device_bf16("temp_[0,:16]", temp_.raw_data(), 16, st);
     }
 
     if (moe.shared_gate.weight) {
@@ -211,6 +289,10 @@ void MoeFfnLayer::Forward(ForwardParam& p)
 void MoeFfnLayer::Combine(ForwardParam& p)
 {
     auto& moe = *p.weights;
+    auto  st  = core::Context::stream().handle();
+
+    TM_LOG_INFO("[MOE_DEBUG] === MoeFfnLayer::Combine === output shape=({}, {})", p.output.shape(0), p.output.shape(1));
+    dump_device_bf16("combine input temp_[0,:16]", temp_.raw_data(), 16, st);
 
     invokeMoeCombine(p.output,
                      temp_,
@@ -224,6 +306,9 @@ void MoeFfnLayer::Combine(ForwardParam& p)
                      p.scale,
                      core::Context::stream().handle());
     sync_check_cuda_error();
+
+    dump_device_bf16("combine output[0,:16]", p.output.raw_data(), 16, st);
+    TM_LOG_INFO("[MOE_DEBUG] === MoeFfnLayer done ===");
 
     temp_          = {};
     shared_scales_ = {};

@@ -17,6 +17,7 @@
 #include "src/turbomind/utils/cuda_utils.h"
 
 #include "src/turbomind/engine/request.h"
+#include "src/turbomind/core/logger.h"
 
 // #include "dbg.h"
 
@@ -240,12 +241,15 @@ void UnifiedDecoder::Forward(int phase, TensorMap& args, const std::vector<Weigh
         std::optional<MoeFfnLayer::ForwardParam> moe_fwd_param;
 
         if (weights.at(layer)->moe_weights) {
+            TM_LOG_INFO("[DECODER_DEBUG] layer={} MoE forward begin, hidden shape=({},{})",
+                        layer, global_hidden_states.shape(0), global_hidden_states.shape(1));
             moe_fwd_param = MoeFfnLayer::ForwardParam{global_hidden_states,
                                                       global_hidden_states,
                                                       weights.at(layer)->moe_weights.get(),
                                                       ffn_layer_ ? 1.f : 0.f,
                                                       layer};
             moe_ffn_layer_->Forward(*moe_fwd_param);
+            TM_LOG_INFO("[DECODER_DEBUG] layer={} MoE forward done", layer);
         }
 
         if (weights.at(layer)->ffn_weights) {
@@ -254,7 +258,9 @@ void UnifiedDecoder::Forward(int phase, TensorMap& args, const std::vector<Weigh
         }
 
         if (moe_fwd_param) {
+            TM_LOG_INFO("[DECODER_DEBUG] layer={} MoE combine begin", layer);
             moe_ffn_layer_->Combine(*moe_fwd_param);
+            TM_LOG_INFO("[DECODER_DEBUG] layer={} MoE combine done", layer);
         }
 
         TM_DEBUG_TENSOR(global_hidden_states, Concat("ffn_block", layer), 2);
